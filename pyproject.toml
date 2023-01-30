@@ -23,7 +23,7 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = "^3.7"
-aiobotocore = {version = "2.4.2", extras = ["boto3"]}
+aiobotocore = {git = "https://github.com/segfault87/aiobotocore", extras = ["boto3"], rev = "a4a0d668d93d9aabcd2e49811f0655d06fe468c1"}
 cryptography = {version = ">=2.3.1", optional = true}
 chalice = {version = ">=1.24.0", optional = true}
 

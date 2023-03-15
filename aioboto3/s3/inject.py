@@ -323,7 +323,10 @@ async def upload_fileobj(
 
     if exception_event.is_set() or len(finished_parts) != expected_parts:
         # An exception during upload or for some reason the finished parts dont match the expected parts, cancel upload
-        await self.abort_multipart_upload(Bucket=Bucket, Key=Key, UploadId=upload_id)
+        try:
+            await self.abort_multipart_upload(Bucket=Bucket, Key=Key, UploadId=upload_id)
+        except:
+            pass
         # Raise exception later after we've disposed of the pending co-routines
     else:
         # All io chunks from the queue have been successfully uploaded

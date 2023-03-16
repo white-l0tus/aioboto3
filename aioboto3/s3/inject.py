@@ -212,31 +212,19 @@ async def upload_fileobj(
     finished_parts = []
     expected_parts = 0
     io_queue = asyncio.Queue(maxsize=max_io_queue)
-    exception_event = asyncio.Event()
-    exception = None
     sent_bytes = 0
 
     async def uploader() -> int:
         nonlocal sent_bytes
-        nonlocal exception
         uploaded_parts = 0
 
-        # Loop whilst no other co-routine has raised an exception
-        while not exception:
-            try:
-                part_args = await io_queue.get()
-            except asyncio.CancelledError:
+        while True:
+            part_args = await io_queue.get()
+            if part_args is None:  # Check if sentinel value is received
                 break
 
             # Submit part to S3
-            try:
-                resp = await self.upload_part(**part_args)
-            except Exception as err:
-                # Set the main exception variable to the current exception, trigger the exception event
-                exception = err
-                exception_event.set()
-                # Exit the coro
-                break
+            resp = await self.upload_part(**part_args)
 
             # Success, add the result to the finished_parts, increment the sent_bytes
             finished_parts.append({'ETag': resp['ETag'], 'PartNumber': part_args['PartNumber']})
@@ -260,7 +248,6 @@ async def upload_fileobj(
 
     async def file_reader() -> None:
         nonlocal expected_parts
-        nonlocal exception
         part = 0
         eof = False
         while not eof:
@@ -268,24 +255,14 @@ async def upload_fileobj(
             multipart_payload = b''
             loop_counter = 0
             while len(multipart_payload) < multipart_chunksize:
-                try:
-                    # Handles if .read() returns anything that can be awaited
-                    data_chunk = Fileobj.read(io_chunksize)
-                    if inspect.isawaitable(data_chunk):
-                        # noinspection PyUnresolvedReferences
-                        data = await data_chunk
-                    else:
-                        data = data_chunk
-                        await asyncio.sleep(0.0)  # Yield to the eventloop incase .read() took ages
-                except Exception as err:
-                    # Caught some random exception whilst reading from a file
-                    exception = err
-                    exception_event.set()
-
-                    # shortcircuit upload logic
-                    eof = True
-                    multipart_payload = b''
-                    break
+                # Handles if .read() returns anything that can be awaited
+                data_chunk = Fileobj.read(io_chunksize)
+                if inspect.isawaitable(data_chunk):
+                    # noinspection PyUnresolvedReferences
+                    data = await data_chunk
+                else:
+                    data = data_chunk
+                    await asyncio.sleep(0.0)  # Yield to the eventloop incase .read() took ages
 
                 if data == b'' and loop_counter > 0:  # End of file, handles uploading empty files
                     eof = True
@@ -308,72 +285,43 @@ async def upload_fileobj(
             logger.debug('Added part to io_queue')
             expected_parts += 1
 
-    file_reader_future = asyncio.ensure_future(file_reader())
-    futures = [asyncio.ensure_future(uploader()) for _ in range(0, max_concurrency)]
+        for _ in range(max_concurrency):
+            await io_queue.put(None) # Add sentinel values to the queue
 
-    # Wait for file reader to finish
-    await file_reader_future
-    # So by this point all of the file is read and in a queue
+    file_reader_future = asyncio.create_task(file_reader())
+    uploader_futures = [asyncio.create_task(uploader()) for _ in range(0, max_concurrency)]
 
-    # wait for either io queue is finished, or an exception has been raised
-    _, pending = await asyncio.wait(
-        {asyncio.create_task(io_queue.join()), asyncio.create_task(exception_event.wait())},
-        return_when=asyncio.FIRST_COMPLETED
-    )
+    try:
+        # Wait for file reader to finish
+        await file_reader_future
+        # So by this point all of the file is read and in a queue
 
-    if exception_event.is_set() or len(finished_parts) != expected_parts:
-        # An exception during upload or for some reason the finished parts dont match the expected parts, cancel upload
-        try:
+        # wait for either io queue is finished, or an exception has been raised
+        await asyncio.gather(*uploader_futures)
+
+        # for some reason the finished parts dont match the expected parts, cancel upload
+        if len(finished_parts) != expected_parts:
+            raise Exception("finished parts don't match the expected parts.")
+    
+        # All io chunks from the queue have been successfully uploaded
+        # Sort the finished parts as they must be in order
+        finished_parts.sort(key=lambda item: item['PartNumber'])
+
+        await self.complete_multipart_upload(
+            Bucket=Bucket,
+            Key=Key,
+            UploadId=upload_id,
+            MultipartUpload={'Parts': finished_parts}
+        )
+    except:
+        for future in uploader_futures:
+            future.cancel()
+        try: 
+            # We failed to upload, abort then return the orginal error
             await self.abort_multipart_upload(Bucket=Bucket, Key=Key, UploadId=upload_id)
         except:
             pass
-        # Raise exception later after we've disposed of the pending co-routines
-    else:
-        # All io chunks from the queue have been successfully uploaded
-        try:
-            # Sort the finished parts as they must be in order
-            finished_parts.sort(key=lambda item: item['PartNumber'])
-
-            await self.complete_multipart_upload(
-                Bucket=Bucket,
-                Key=Key,
-                UploadId=upload_id,
-                MultipartUpload={'Parts': finished_parts}
-            )
-        except Exception as err:
-            # We failed to complete the upload, try and abort, then return the orginal error
-            exception = err
-            try:
-                await self.abort_multipart_upload(Bucket=Bucket, Key=Key, UploadId=upload_id)
-            except:
-                pass
-
-    # Close either the Queue.join() coro, or the event.wait() coro
-    for coro in pending:
-        if not coro.done():
-            coro.cancel()
-            try:
-                await coro
-            except:
-                pass
-
-    # Cancel any remaining futures, though if successful they'll be done
-    cancelled = []
-    for future in futures:
-        if not future.done():
-            future.cancel()
-            cancelled.append(future)
-        else:
-            uploaded_parts = future.result()
-            logger.debug('Future uploaded {0} parts'.format(uploaded_parts))
-    if cancelled:
-        for uploaded_parts in await asyncio.gather(*cancelled, return_exceptions=True):
-            if isinstance(uploaded_parts, int):
-                logger.debug('Future uploaded {0} parts'.format(uploaded_parts))
-
-    # Raise an exception now after everythings cleaned up
-    if exception:
-        raise exception
+        raise
 
 
 async def upload_file(
